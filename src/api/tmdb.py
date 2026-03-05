@@ -4,6 +4,7 @@ TMDB API client.
 This module provides functionality for interacting with The Movie Database API.
 """
 
+import os
 import requests
 from typing import List, Dict, Any, Optional
 
@@ -11,6 +12,15 @@ from src.config import TMDB_API_KEY, TMDB_BASE_URL
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+def _is_debug_enabled() -> bool:
+    return os.environ.get("SCANLY_DEBUG", "").lower() in ("1", "true", "yes", "on")
+
+def _redact_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    redacted = dict(params or {})
+    if 'api_key' in redacted and redacted['api_key']:
+        redacted['api_key'] = '***REDACTED***'
+    return redacted
 
 
 class TMDB:
@@ -50,12 +60,38 @@ class TMDB:
         
         # Add API key
         params['api_key'] = self.api_key
+        debug_enabled = _is_debug_enabled()
+        safe_params = _redact_params(params)
+        if debug_enabled:
+            print(f"[TMDB DEBUG] Request: GET {url} params={safe_params}")
+            logger.debug(f"TMDB request GET {url} params={safe_params}")
         
         try:
             response = requests.get(url, params=params, timeout=10)
+            if debug_enabled:
+                print(f"[TMDB DEBUG] Response: status={response.status_code} endpoint={endpoint}")
+                logger.debug(f"TMDB response status={response.status_code} endpoint={endpoint}")
             response.raise_for_status()  # Raise exception for non-200 status codes
-            return response.json()
+            data = response.json()
+            if debug_enabled:
+                if isinstance(data, dict):
+                    results_count = len(data.get("results", [])) if isinstance(data.get("results"), list) else "n/a"
+                    keys_preview = list(data.keys())[:8]
+                    print(f"[TMDB DEBUG] Response JSON keys={keys_preview} results_count={results_count}")
+                    logger.debug(f"TMDB response json keys={keys_preview} results_count={results_count}")
+                else:
+                    print(f"[TMDB DEBUG] Response JSON type={type(data).__name__}")
+                    logger.debug(f"TMDB response json type={type(data).__name__}")
+            return data
         except requests.exceptions.RequestException as e:
+            if debug_enabled:
+                status = getattr(getattr(e, "response", None), "status_code", "n/a")
+                body = ""
+                if getattr(e, "response", None) is not None:
+                    body = (e.response.text or "")[:500]
+                print(f"[TMDB DEBUG] Error: endpoint={endpoint} status={status} error={e}")
+                if body:
+                    print(f"[TMDB DEBUG] Error body (truncated): {body}")
             logger.error(f"Error making TMDB API request to {endpoint}: {e}")
             return {"results": []}
     

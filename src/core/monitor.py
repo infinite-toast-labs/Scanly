@@ -8,19 +8,29 @@ import json
 import threading
 import time
 import logging
-from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from src.main import load_scan_history_set, is_any_media_file_in_scan_history
 
 logger = logging.getLogger(__name__)
+SUPPORTED_MEDIA_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.m4v', '.ts', '.divx')
+IGNORED_SUFFIXES = ('.part', '.tmp', '.crdownload', '.!qB', '.download')
+
+def _get_main_attr(attr_name):
+    """Resolve functions from the running main module without hard-binding imports."""
+    main_mod = sys.modules.get('__main__')
+    if main_mod and hasattr(main_mod, attr_name):
+        return getattr(main_mod, attr_name)
+
+    from src import main as main_module
+    return getattr(main_module, attr_name)
 
 class DirectoryChangeHandler(FileSystemEventHandler):
     """Event handler for directory changes that detects new folders."""
-    def __init__(self, callback, directory_id, monitored_path):
-        self.callback = callback
+    def __init__(self, directory_callback, file_callback, directory_id, monitored_path):
+        self.directory_callback = directory_callback
+        self.file_callback = file_callback
         self.directory_id = directory_id
         self.monitored_path = monitored_path  # Store the monitored path
         self.changes = set()
@@ -32,7 +42,11 @@ class DirectoryChangeHandler(FileSystemEventHandler):
         logger.debug(f"Event detected: {event.src_path}, is_directory={event.is_directory}")
         if event.is_directory:
             if self._is_valid_directory(event.src_path):
-                self.callback(self.directory_id, event.src_path)
+                self.directory_callback(self.directory_id, event.src_path)
+            return
+
+        if self._is_valid_media_file(event.src_path):
+            self.file_callback(self.directory_id, event.src_path)
         
     def _is_valid_directory(self, path):
         """Check if this is a valid directory we should notify about."""
@@ -42,6 +56,15 @@ class DirectoryChangeHandler(FileSystemEventHandler):
             return False
         # Add more rules as needed
         return True
+
+    def _is_valid_media_file(self, path):
+        """Return True for supported media files and skip temporary download artifacts."""
+        name = os.path.basename(path)
+        if not name or name.startswith('.'):
+            return False
+        if any(name.endswith(suffix) for suffix in IGNORED_SUFFIXES):
+            return False
+        return os.path.splitext(name)[1].lower() in SUPPORTED_MEDIA_EXTENSIONS
 
     def _schedule_notification(self):
         pass  # Placeholder for future notification scheduling logic
@@ -58,7 +81,7 @@ class MonitorManager:
         self._pending_files = {}
         self._initial_scan_thread = None
         self._initial_scan_running = False
-        self.scan_history_set = load_scan_history_set()
+        self.scan_history_set = set()
         self._ensure_config_dir()
         self._load_monitored_directories()
 
@@ -201,7 +224,8 @@ class MonitorManager:
                 logger.info(f"Using standard Observer for {path}")
                 observer = Observer()
                 event_handler = DirectoryChangeHandler(
-                    callback=self._on_directory_detected,
+                    directory_callback=self._on_directory_detected,
+                    file_callback=self._on_file_detected,
                     directory_id=dir_id,
                     monitored_path=path
                 )
@@ -227,6 +251,8 @@ class MonitorManager:
             for entry in os.scandir(path):
                 if entry.is_dir() and not entry.name.startswith('.'):
                     self._on_directory_detected(dir_id, entry.path)
+                elif entry.is_file() and os.path.splitext(entry.name)[1].lower() in SUPPORTED_MEDIA_EXTENSIONS:
+                    self._on_file_detected(dir_id, entry.path)
         except Exception as e:
             logger.error(f"Error scanning rclone directory: {e}")
 
@@ -251,7 +277,8 @@ class MonitorManager:
             return
 
         # --- CRITICAL: Check if any media file in this folder is in scan history ---
-        from src.main import load_scan_history_set, is_any_media_file_in_scan_history
+        load_scan_history_set = _get_main_attr('load_scan_history_set')
+        is_any_media_file_in_scan_history = _get_main_attr('is_any_media_file_in_scan_history')
         scan_history_set = load_scan_history_set()
         scan_history_check = is_any_media_file_in_scan_history(dir_path, scan_history_set)
         logger.info(f"DEBUG: Monitor scan history check for {dir_path}: {scan_history_check}")
@@ -262,6 +289,35 @@ class MonitorManager:
 
         folder_name = os.path.relpath(dir_path, monitored_path)
         self._send_directory_notification(dir_name, folder_name)
+
+    def _on_file_detected(self, dir_id, file_path):
+        """Process newly created media files in monitored directories."""
+        logger.debug(f"Triggered _on_file_detected with dir_id={dir_id}, file_path={file_path}")
+        if dir_id not in self._monitored_directories:
+            logger.error(f"Unknown dir_id: {dir_id} for detected file {file_path}")
+            return
+
+        if not os.path.isfile(file_path):
+            logger.info(f"Skipping file event for non-file path: {file_path}")
+            return
+
+        load_scan_history_set = _get_main_attr('load_scan_history_set')
+        process_media_file_non_interactive = _get_main_attr('process_media_file_non_interactive')
+
+        normalized_path = os.path.abspath(file_path)
+        scan_history_set = load_scan_history_set()
+        if normalized_path in scan_history_set:
+            logger.info(f"Skipping already processed file from monitor: {normalized_path}")
+            return
+
+        try:
+            success = process_media_file_non_interactive(normalized_path)
+            if success:
+                logger.info(f"Monitor processed new media file: {normalized_path}")
+            else:
+                logger.info(f"Monitor skipped new media file: {normalized_path}")
+        except Exception as e:
+            logger.error(f"Error processing monitored file {normalized_path}: {e}")
 
     def _send_directory_notification(self, dir_name, folder_name):
         logger.info(f"New directory detected: {dir_name} - {folder_name}")

@@ -84,11 +84,15 @@ See `.env.template` for all available options.
 ```bash
 python src/main.py --scan /path/to/media
 python src/main.py --monitor /path/to/watch
+python src/main.py --monitor
+python src/main.py --clear-history
+python src/main.py --clear-history family.guy.s22e14.1080p.web.h264-successfulcrab.mkv
 ```
 
 **Common CLI options:**
-- `--scan` / `-s`: Scan a directory
-- `--monitor` / `-w`: Monitor a directory for changes
+- `--scan` / `-s`: Scan a directory (non-interactive)
+- `--monitor` / `-w`: Monitor directories for changes; pass a directory to add/watch immediately, or run without a path to use saved active monitors
+- `--clear-history [FILE]`: Clear all scan history, or only entries matching a file/path fragment
 - `--movie` / `-m`: Process as movie
 - `--tv` / `-t`: Process as TV show
 - `--debug` / `-d`: Enable debug mode

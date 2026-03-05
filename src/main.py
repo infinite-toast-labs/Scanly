@@ -16,9 +16,14 @@ import subprocess
 import csv
 import sqlite3
 from pathlib import Path
-from utils.plex_utils import refresh_selected_plex_libraries
 from utils.cleaning_patterns import patterns_to_remove, case_sensitive_patterns
 from utils.scan_logic import normalize_title, normalize_unicode
+
+try:
+    from utils.plex_utils import refresh_selected_plex_libraries
+except Exception:
+    def refresh_selected_plex_libraries(*args, **kwargs):
+        return {"status": "skipped", "reason": "plexapi unavailable"}
 
 # --- Add this helper function for consistent cleaning ---
 def clean_title_with_patterns(title):
@@ -119,6 +124,16 @@ logging.basicConfig(
 # Get logger for this module
 logger = get_logger(__name__)
 
+def enable_debug_logging():
+    """Enable debug logging for this run."""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    for handler in root_logger.handlers:
+        handler.setLevel(logging.DEBUG)
+    logger.setLevel(logging.DEBUG)
+    os.environ["SCANLY_DEBUG"] = "1"
+    logger.debug("Debug logging enabled")
+
 # Add this function as a standalone function, outside of any class
 def _update_env_var(name, value):
     """Update an environment variable both in memory and in .env file."""
@@ -187,6 +202,28 @@ except ImportError as e:
 
 # Get destination directory from environment variables
 DESTINATION_DIRECTORY = os.environ.get('DESTINATION_DIRECTORY', '')
+
+def _get_env_folder_name(env_var, default_name):
+    """Get folder name from env var with sane fallback and quote trimming."""
+    value = os.environ.get(env_var, default_name)
+    if value is None:
+        return default_name
+    cleaned = str(value).strip().strip('"').strip("'")
+    return cleaned or default_name
+
+def get_destination_subdir(is_tv=False, is_anime=False, is_wrestling=False):
+    """Resolve destination subdirectory using custom folder env vars."""
+    if is_wrestling:
+        folder_name = _get_env_folder_name('CUSTOM_WRESTLING_FOLDER', 'Wrestling')
+    elif is_anime and is_tv:
+        folder_name = _get_env_folder_name('CUSTOM_ANIME_SHOW_FOLDER', 'Anime Shows')
+    elif is_anime and not is_tv:
+        folder_name = _get_env_folder_name('CUSTOM_ANIME_MOVIE_FOLDER', 'Anime Movies')
+    elif is_tv and not is_anime:
+        folder_name = _get_env_folder_name('CUSTOM_SHOW_FOLDER', 'TV Shows')
+    else:
+        folder_name = _get_env_folder_name('CUSTOM_MOVIE_FOLDER', 'Movies')
+    return os.path.join(DESTINATION_DIRECTORY, folder_name)
 
 # Clean directory path
 def _clean_directory_path(path):
@@ -273,6 +310,72 @@ def load_scan_history_set():
     conn.close()
     paths.update(row[0] for row in db_paths)
     return paths
+
+def _history_path_matches(path_value, needle):
+    """Return True if a stored history path matches a user-provided needle."""
+    if not needle:
+        return True
+
+    path_str = str(path_value).strip()
+    needle_str = str(needle).strip()
+    if not path_str or not needle_str:
+        return False
+
+    if path_str == needle_str:
+        return True
+    if os.path.basename(path_str) == needle_str:
+        return True
+    if needle_str in path_str:
+        return True
+    return False
+
+def clear_scan_history_entries(file_name=None):
+    """Clear all scan history, or only entries matching file_name."""
+    removed_txt = 0
+    removed_db = 0
+
+    # Clear text history
+    if os.path.exists(SCAN_HISTORY_FILE):
+        with open(SCAN_HISTORY_FILE, 'r') as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        if file_name:
+            kept_lines = []
+            for line in lines:
+                if _history_path_matches(line, file_name):
+                    removed_txt += 1
+                else:
+                    kept_lines.append(line)
+            with open(SCAN_HISTORY_FILE, 'w') as f:
+                if kept_lines:
+                    f.write('\n'.join(kept_lines) + '\n')
+        else:
+            removed_txt = len(lines)
+            with open(SCAN_HISTORY_FILE, 'w') as f:
+                f.write('')
+
+    # Clear archived DB history
+    _init_scan_history_db()
+    conn = sqlite3.connect(SCAN_HISTORY_DB)
+    c = conn.cursor()
+
+    if file_name:
+        c.execute('SELECT path FROM archived_scan_history')
+        db_paths = [row[0] for row in c.fetchall()]
+        matches = [p for p in db_paths if _history_path_matches(p, file_name)]
+        for match in matches:
+            c.execute('DELETE FROM archived_scan_history WHERE path=?', (match,))
+        removed_db = len(matches)
+    else:
+        c.execute('SELECT COUNT(*) FROM archived_scan_history')
+        removed_db = c.fetchone()[0] or 0
+        c.execute('DELETE FROM archived_scan_history')
+
+    conn.commit()
+    conn.close()
+
+    reload_global_scan_history()
+    return removed_txt, removed_db
 
 def is_any_media_file_in_scan_history(folder_path, scan_history_set):
     """
@@ -598,6 +701,118 @@ def get_default_content_type_for_path(path):
             return flags
     return None  # No default
 
+SUPPORTED_MEDIA_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.m4v', '.ts', '.divx')
+
+def is_supported_media_file(file_path):
+    """Return True if path is an existing supported media file."""
+    if not os.path.isfile(file_path):
+        return False
+    return os.path.splitext(file_path)[1].lower() in SUPPORTED_MEDIA_EXTENSIONS
+
+def infer_media_metadata_for_file(file_path):
+    """Infer title/type/episode metadata for non-interactive processing."""
+    filename = os.path.basename(file_path)
+    title_part = os.path.splitext(filename)[0]
+
+    year_match = re.search(r'(19\d{2}|20\d{2})', title_part)
+    year = year_match.group(1) if year_match else None
+
+    clean_title = title_part
+    if year:
+        clean_title = clean_title.replace(year, ' ').strip()
+    clean_title = clean_title_with_patterns(clean_title)
+    clean_title = normalize_unicode(clean_title).strip()
+    if not clean_title:
+        clean_title = title_part
+
+    parent_dir = os.path.dirname(file_path)
+    default_flags = get_default_content_type_for_path(parent_dir)
+    if default_flags:
+        is_tv, is_anime, is_wrestling = default_flags
+    else:
+        is_tv = bool(re.search(r'[sS]\d{1,2}[eE]\d{1,3}|season|episode', filename, re.IGNORECASE))
+        is_anime = bool(re.search(r'anime|subbed|dubbed|\[jp\]|\[jpn\]', filename, re.IGNORECASE))
+        is_wrestling = bool(re.search(r'wrestling|wwe|aew|njpw', filename, re.IGNORECASE))
+
+    season_number = None
+    episode_number = None
+    episode_name = None
+    if is_tv and not is_wrestling:
+        season_match = re.search(r'[sS](\d{1,2})', filename)
+        episode_match = re.search(r'[eE](\d{1,3})', filename)
+        season_number = int(season_match.group(1)) if season_match else 1
+        if episode_match:
+            episode_number = int(episode_match.group(1))
+        elif re.search(r'(extra|special|behind|making|deleted|bonus)', filename, re.IGNORECASE):
+            episode_name = "Special"
+        else:
+            episode_number = 1
+
+    return {
+        "title": clean_title,
+        "year": year,
+        "is_tv": is_tv,
+        "is_anime": is_anime,
+        "is_wrestling": is_wrestling,
+        "season_number": season_number,
+        "episode_number": episode_number,
+        "episode_name": episode_name
+    }
+
+def process_media_file_non_interactive(file_path, ignore_scan_history=False):
+    """Process one media file without prompts and create a link/copy destination entry."""
+    abs_file_path = os.path.abspath(file_path)
+    if not is_supported_media_file(abs_file_path):
+        logger.info(f"Skipping unsupported or missing file: {abs_file_path}")
+        return False
+
+    metadata = infer_media_metadata_for_file(abs_file_path)
+    processor = DirectoryProcessor(os.path.dirname(abs_file_path), auto_mode=True)
+
+    return processor._create_symlink_for_single_file(
+        abs_file_path,
+        metadata["title"],
+        metadata["year"],
+        metadata["is_tv"],
+        metadata["is_anime"],
+        metadata["is_wrestling"],
+        None,
+        metadata["season_number"],
+        metadata["episode_number"],
+        metadata["episode_name"],
+        ignore_scan_history
+    )
+
+def scan_directory_non_interactive(scan_path):
+    """Scan a directory recursively, processing supported files without user prompts."""
+    clean_path = _clean_directory_path(scan_path)
+    if not clean_path:
+        return 0, 0, 0
+
+    if os.path.isfile(clean_path):
+        processed = 1 if process_media_file_non_interactive(clean_path) else 0
+        return processed, 1, (1 - processed)
+
+    if not os.path.isdir(clean_path):
+        return 0, 0, 0
+
+    media_files = []
+    for root, _, files in os.walk(clean_path):
+        for file_name in files:
+            file_path = os.path.join(root, file_name)
+            if is_supported_media_file(file_path):
+                media_files.append(file_path)
+
+    media_files.sort()
+    processed_count = 0
+    for file_path in media_files:
+        if process_media_file_non_interactive(file_path):
+            processed_count += 1
+
+    total_files = len(media_files)
+    skipped_count = total_files - processed_count
+    return processed_count, total_files, skipped_count
+
 class DirectoryProcessor:
     """Process a directory of media files."""
     def __init__(self, directory_path, resume=False, auto_mode=False):
@@ -909,16 +1124,11 @@ class DirectoryProcessor:
             safe_base_name = sanitize_filename(base_name)
             safe_folder_name = sanitize_filename(folder_name)
             
-            if is_wrestling:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "Wrestling")
-            elif is_anime and is_tv:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "Anime Series")
-            elif is_anime and not is_tv:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "Anime Movies")
-            elif not is_anime and is_tv:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "TV Series")
-            else:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "Movies")
+            dest_subdir = get_destination_subdir(
+                is_tv=is_tv,
+                is_anime=is_anime,
+                is_wrestling=is_wrestling
+            )
 
             target_dir_path = os.path.join(dest_subdir, safe_folder_name)
             os.makedirs(target_dir_path, exist_ok=True)
@@ -1196,16 +1406,11 @@ class DirectoryProcessor:
             safe_base_name = sanitize_filename(base_name)
             safe_folder_name = sanitize_filename(folder_name)
             
-            if is_wrestling:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "Wrestling")
-            elif is_anime and is_tv:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "Anime Series")
-            elif is_anime and not is_tv:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "Anime Movies")
-            elif not is_anime and is_tv:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "TV Series")
-            else:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "Movies")
+            dest_subdir = get_destination_subdir(
+                is_tv=is_tv,
+                is_anime=is_anime,
+                is_wrestling=is_wrestling
+            )
 
             target_dir_path = os.path.join(dest_subdir, safe_folder_name)
             os.makedirs(target_dir_path, exist_ok=True)
@@ -1601,7 +1806,11 @@ class DirectoryProcessor:
                             episode_num = int(season_match.group(2))
                             
                             # Check for existing episode in destination using cleaned title
-                            tv_series_dir = os.path.join(DESTINATION_DIRECTORY, "TV Series")
+                            tv_series_dir = get_destination_subdir(
+                                is_tv=is_tv,
+                                is_anime=is_anime,
+                                is_wrestling=is_wrestling
+                            )
                             if os.path.exists(tv_series_dir):
                                 for show_folder in os.listdir(tv_series_dir):
                                     show_path = os.path.join(tv_series_dir, show_folder)
@@ -2452,16 +2661,11 @@ class DirectoryProcessor:
             safe_folder_name = sanitize_filename(folder_name)
 
             # Determine appropriate subdirectory based on content type
-            if is_wrestling:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "Wrestling")
-            elif is_anime and is_tv:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "Anime Series")
-            elif is_anime and not is_tv:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "Anime Movies")
-            elif is_tv and not is_anime:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "TV Series")
-            else:
-                dest_subdir = os.path.join(DESTINATION_DIRECTORY, "Movies")
+            dest_subdir = get_destination_subdir(
+                is_tv=is_tv,
+                is_anime=is_anime,
+                is_wrestling=is_wrestling
+            )
 
             target_dir_path = os.path.join(dest_subdir, safe_folder_name)
             if os.path.exists(target_dir_path):
@@ -4016,10 +4220,110 @@ def trigger_plex_refresh():
 # Ensure main function also properly clears screen between menus
 def main():
     parser = argparse.ArgumentParser(description="Scanly Media Scanner")
-    parser.add_argument('--monitor', action='store_true', help='Run monitor scan only (no menu)')
+    parser.add_argument('--scan', '-s', metavar='DIR', help='Run a non-interactive scan for a directory and exit')
+    parser.add_argument('--debug', '-d', action='store_true', help='Enable debug logging for this run')
+    parser.add_argument(
+        '--clear-history',
+        nargs='?',
+        const='__CLEAR_ALL_HISTORY__',
+        metavar='FILE',
+        help='Clear scan history (all entries, or only entries matching FILE)'
+    )
+    parser.add_argument(
+        '--monitor', '-w',
+        nargs='?',
+        const='__USE_SAVED_MONITORS__',
+        metavar='DIR',
+        help='Run monitor mode; optionally provide a directory to add/watch immediately'
+    )
     args = parser.parse_args()
 
-    # --- ADD THIS BLOCK: Resume scan if temp file exists ---
+    if args.debug:
+        enable_debug_logging()
+
+    if args.clear_history is not None and (args.scan or args.monitor is not None):
+        parser.error("Use --clear-history by itself, not with --scan/--monitor.")
+
+    if args.clear_history is not None:
+        clear_target = None
+        if args.clear_history != '__CLEAR_ALL_HISTORY__':
+            clear_target = args.clear_history
+
+        removed_txt, removed_db = clear_scan_history_entries(clear_target)
+        if clear_target:
+            print(f"\nCleared scan history entries matching: {clear_target}")
+        else:
+            print("\nCleared all scan history entries.")
+        print(f"Removed from scan_history.txt: {removed_txt}")
+        print(f"Removed from archived_scan_history DB: {removed_db}")
+        return
+
+    if args.scan and args.monitor is not None:
+        parser.error("Use either --scan or --monitor, not both.")
+
+    if args.scan:
+        scan_target = _clean_directory_path(args.scan)
+        if not scan_target or not os.path.isdir(scan_target):
+            print(f"\nError: {scan_target} is not a valid directory.")
+            return
+
+        processed_count, total_files, skipped_count = scan_directory_non_interactive(scan_target)
+        print(f"\nScan complete for: {scan_target}")
+        print(f"Processed: {processed_count}")
+        print(f"Skipped: {skipped_count}")
+        print(f"Total media files found: {total_files}")
+        return
+
+    if args.monitor is not None:
+        monitor_manager = get_monitor_manager()
+        if not monitor_manager:
+            print("\nError: Monitor functionality is not available.")
+            return
+
+        monitor_target = None
+        if args.monitor != '__USE_SAVED_MONITORS__':
+            monitor_target = _clean_directory_path(args.monitor)
+            if not monitor_target or not os.path.isdir(monitor_target):
+                print(f"\nError: {monitor_target} is not a valid directory.")
+                return
+
+            monitored_dirs = monitor_manager.get_monitored_directories()
+            existing_dir_id = None
+            for dir_id, info in monitored_dirs.items():
+                saved_path = _clean_directory_path(info.get('path', ''))
+                if saved_path == monitor_target:
+                    existing_dir_id = dir_id
+                    break
+
+            if existing_dir_id is None:
+                existing_dir_id = monitor_manager.add_directory(
+                    monitor_target,
+                    os.path.basename(monitor_target) or monitor_target
+                )
+                if not existing_dir_id:
+                    print(f"\nFailed to add monitor directory: {monitor_target}")
+                    return
+
+            dir_info = monitor_manager.get_monitored_directories().get(existing_dir_id, {})
+            if not dir_info.get('active', False):
+                activated = monitor_manager.toggle_directory_active(existing_dir_id)
+                if not activated:
+                    print(f"\nFailed to activate monitoring for: {monitor_target}")
+                    return
+
+            print(f"Monitoring directory: {monitor_target}")
+        else:
+            print("Monitoring saved active directories.")
+
+        monitor_manager.start_monitoring()
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            pass
+        return
+
+    # --- Resume scan if temp file exists (interactive mode only) ---
     resume_path = load_resume_path()
     if resume_path and os.path.isdir(resume_path):
         clear_screen()
@@ -4037,18 +4341,6 @@ def main():
             print("\nScan did not complete successfully.")
         input("\nPress Enter to continue...")
         clear_screen()
-
-    if args.monitor:
-        # Start monitor manager directly, no menu or input
-        monitor_manager = get_monitor_manager()
-        monitor_manager.start_monitoring()  # <-- Use the correct method
-        # Optionally, keep the process alive if needed:
-        try:
-            while True:
-                time.sleep(60)
-        except KeyboardInterrupt:
-            pass
-        return
 
     # Make sure the screen is clear before we start
     clear_screen()
