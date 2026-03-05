@@ -314,6 +314,12 @@ class MonitorManager:
             success = process_media_file_non_interactive(normalized_path)
             if success:
                 logger.info(f"Monitor processed new media file: {normalized_path}")
+                trigger_plex_refresh = _get_main_attr('trigger_plex_refresh')
+                if trigger_plex_refresh:
+                    try:
+                        trigger_plex_refresh()
+                    except Exception as e:
+                        logger.error(f"Error triggering Plex refresh: {e}")
             else:
                 logger.info(f"Monitor skipped new media file: {normalized_path}")
         except Exception as e:

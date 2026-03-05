@@ -4202,6 +4202,11 @@ def settings_menu():
 
 def trigger_plex_refresh():
     """Refresh only the applicable Plex libraries after a scan."""
+    ENABLE_PLEX_UPDATE = os.getenv("ENABLE_PLEX_UPDATE", "false").lower() == "true"
+    if not ENABLE_PLEX_UPDATE:
+        logger.debug("Plex refresh skipped: ENABLE_PLEX_UPDATE is false")
+        return
+    
     PLEX_URL = os.getenv("PLEX_URL")
     PLEX_TOKEN = os.getenv("PLEX_TOKEN")
     LIBRARIES = [
@@ -4214,7 +4219,9 @@ def trigger_plex_refresh():
     if PLEX_URL and PLEX_TOKEN and LIBRARIES:
         result = refresh_selected_plex_libraries(PLEX_URL, PLEX_TOKEN, LIBRARIES)
         print("Plex refresh results:", result)
+        logger.info(f"Plex refresh results: {result}")
     else:
+        logger.warning(f"Plex refresh skipped: missing configuration. URL={bool(PLEX_URL)}, Token={bool(PLEX_TOKEN)}, Libraries={LIBRARIES}")
         print("Plex refresh skipped: missing configuration.")
 
 # Ensure main function also properly clears screen between menus
