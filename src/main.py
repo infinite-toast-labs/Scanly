@@ -80,7 +80,24 @@ def load_resume_path():
 
 def sanitize_filename(name):
     """Replace problematic characters for cross-platform compatibility."""
-    return re.sub(r'[:/\\]', '-', name)
+    name = re.sub(r'[:/\\]', '-', name)
+    return name
+
+def normalize_folder_name(name):
+    """Normalize folder name to title case for consistent directory naming."""
+    name = sanitize_filename(name)
+    words = name.split()
+    normalized_words = []
+    for word in words:
+        lower = word.lower()
+        if lower in ('a', 'an', 'the', 'and', 'but', 'or', 'for', 'nor', 'on', 'at', 'to', 'from', 'by'):
+            if normalized_words:
+                normalized_words.append(lower)
+            else:
+                normalized_words.append(word.capitalize())
+        else:
+            normalized_words.append(word.capitalize())
+    return ' '.join(normalized_words)
 
 # Ensure parent directory is in path for imports
 parent_dir = os.path.dirname(os.path.dirname(__file__))
@@ -767,6 +784,27 @@ def process_media_file_non_interactive(file_path, ignore_scan_history=False):
         return False
 
     metadata = infer_media_metadata_for_file(abs_file_path)
+    
+    # For movies, check if this is the largest file in its directory
+    if not metadata["is_tv"] and not metadata["is_wrestling"]:
+        parent_dir = os.path.dirname(abs_file_path)
+        sibling_files = []
+        for f in os.listdir(parent_dir):
+            full_path = os.path.join(parent_dir, f)
+            if is_supported_media_file(full_path):
+                try:
+                    size = os.path.getsize(full_path)
+                    sibling_files.append((full_path, size))
+                except OSError:
+                    pass
+        
+        if len(sibling_files) > 1:
+            sibling_files.sort(key=lambda x: x[1], reverse=True)
+            largest_file = sibling_files[0][0]
+            if abs_file_path != largest_file:
+                logger.info(f"Skipping smaller file (sample): {os.path.basename(abs_file_path)}")
+                return False
+
     processor = DirectoryProcessor(os.path.dirname(abs_file_path), auto_mode=True)
 
     return processor._create_symlink_for_single_file(
@@ -1120,9 +1158,12 @@ class DirectoryProcessor:
             base_name = f"{title} ({year})" if year and not is_wrestling else title
             folder_name = f"{base_name} {{tmdb-{tmdb_id}}}" if tmdb_id else base_name
             
-            # Sanitize for filesystem safety
-            safe_base_name = sanitize_filename(base_name)
-            safe_folder_name = sanitize_filename(folder_name)
+            # Normalize folder name to title case for consistency
+            safe_base_name = normalize_folder_name(base_name)
+            if tmdb_id:
+                safe_folder_name = normalize_folder_name(base_name) + f" {{tmdb-{tmdb_id}}}"
+            else:
+                safe_folder_name = normalize_folder_name(folder_name)
             
             dest_subdir = get_destination_subdir(
                 is_tv=is_tv,
@@ -1285,27 +1326,42 @@ class DirectoryProcessor:
 
             else:
                 # Movie/Anime Movie/Wrestling logic
+                # Collect all media files, pick the largest one (actual movie over sample)
+                all_media_files = []
                 for root, dirs, files in os.walk(subfolder_path):
                     for file in files:
                         source_file_path = os.path.join(root, file)
-                        # SKIP if already in scan history
                         if source_file_path in GLOBAL_SCAN_HISTORY_SET:
                             continue
+                        if file.lower().endswith(('.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.m4v', '.ts', '.divx')):
+                            try:
+                                file_size = os.path.getsize(source_file_path)
+                                all_media_files.append((source_file_path, file, file_size))
+                            except OSError:
+                                continue
+                
+                if all_media_files:
+                    # Sort by size descending, pick largest
+                    all_media_files.sort(key=lambda x: x[2], reverse=True)
+                    source_file_path, file, file_size = all_media_files[0]
+                    
+                    self.logger.info(f"Selected largest file ({file_size} bytes): {file}")
+                    if len(all_media_files) > 1:
+                        self.logger.info(f"Skipping {len(all_media_files) - 1} smaller file(s) (samples/extras)")
+                    
+                    file_ext = os.path.splitext(file)[1]
+                    dest_file_name = f"{safe_base_name}{file_ext}"
+                    dest_file_path = os.path.join(target_dir_path, dest_file_name)
+                    
+                    if use_symlinks:
+                        os.symlink(source_file_path, dest_file_path)
+                        self.logger.info(f"Created symlink: {dest_file_path} -> {source_file_path}")
+                    else:
+                        shutil.copy2(source_file_path, dest_file_path)
+                        self.logger.info(f"Copied file: {source_file_path} -> {dest_file_path}")
 
-                        file_ext = os.path.splitext(file)[1]
-                        dest_file_name = f"{safe_base_name}{file_ext}"
-                        dest_file_path = os.path.join(target_dir_path, dest_file_name)
-                        if os.path.islink(dest_file_path) or os.path.exists(dest_file_path):
-                            os.remove(dest_file_path)
-                        if use_symlinks:
-                            os.symlink(source_file_path, dest_file_path)
-                            self.logger.info(f"Created symlink: {dest_file_path} -> {source_file_path}")
-                        else:
-                            shutil.copy2(source_file_path, dest_file_path)
-                            self.logger.info(f"Copied file: {source_file_path} -> {dest_file_path}")
-
-                        append_to_scan_history(source_file_path)
-                        processed_any = True
+                    append_to_scan_history(source_file_path)
+                    processed_any = True
 
                 # Send one webhook for the movie folder
                 if processed_any:
@@ -1402,9 +1458,12 @@ class DirectoryProcessor:
             base_name = f"{title} ({year})" if year and not is_wrestling else title
             folder_name = f"{base_name} {{tmdb-{tmdb_id}}}" if tmdb_id else base_name
             
-            # Sanitize for filesystem safety
-            safe_base_name = sanitize_filename(base_name)
-            safe_folder_name = sanitize_filename(folder_name)
+            # Normalize folder name to title case for consistency
+            safe_base_name = normalize_folder_name(base_name)
+            if tmdb_id:
+                safe_folder_name = normalize_folder_name(base_name) + f" {{tmdb-{tmdb_id}}}"
+            else:
+                safe_folder_name = normalize_folder_name(folder_name)
             
             dest_subdir = get_destination_subdir(
                 is_tv=is_tv,
@@ -1469,7 +1528,7 @@ class DirectoryProcessor:
                 dest_file_path = os.path.join(season_dir, ep_symlink_name)
             else:
                 # Movie processing
-                movie_symlink_name = f"{base_name}{file_ext}"
+                movie_symlink_name = f"{safe_base_name}{file_ext}"
                 dest_file_path = os.path.join(target_dir_path, movie_symlink_name)
 
             # Remove existing file/symlink if it exists
@@ -2656,9 +2715,12 @@ class DirectoryProcessor:
             if tmdb_id:
                 folder_name = f"{base_name} {{tmdb-{tmdb_id}}}"
             
-            # Sanitize for filesystem safety
-            safe_base_name = sanitize_filename(base_name)
-            safe_folder_name = sanitize_filename(folder_name)
+            # Normalize folder name to title case for consistency
+            safe_base_name = normalize_folder_name(base_name)
+            if tmdb_id:
+                safe_folder_name = normalize_folder_name(base_name) + f" {{tmdb-{tmdb_id}}}"
+            else:
+                safe_folder_name = normalize_folder_name(folder_name)
 
             # Determine appropriate subdirectory based on content type
             dest_subdir = get_destination_subdir(
